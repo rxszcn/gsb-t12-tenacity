@@ -39,8 +39,9 @@ from tenacity import (
     retry_if_result,
     stop_after_attempt,
 )
+from tenacity import _utils
 from tenacity import asyncio as tasyncio
-from tenacity.wait import wait_fixed
+from tenacity.wait import wait_chain, wait_combine, wait_fixed
 
 from .test_tenacity import (
     NoIOErrorAfterCount,
@@ -82,6 +83,100 @@ class TestAsyncio(unittest.TestCase):
         thing = NoIOErrorAfterCount(5)
         await _retryable_coroutine(thing)
         assert thing.counter == thing.count
+
+    # -- Convention, async path ---------------------------------------------
+    #
+    # AsyncRetrying calls its wait strategy with the state positionally, so
+    # the same members documented in test_tenacity.py -- built-in wait
+    # strategies, plain functions and lambdas, regardless of parameter name
+    # -- work inside wait_combine/wait_chain here too. Async members are
+    # awaited transparently; the combiners themselves need no "async"
+    # spelling at the call site.
+
+    async def _invoke(self, wait: object, state: RetryCallState) -> float:
+        # Exactly how AsyncRetrying._run_wait invokes the wait strategy.
+        return await _utils.wrap_to_async_func(wait)(state)  # type: ignore[arg-type]
+
+    @asynctest
+    async def test_wait_combiners_call_members_positionally(self) -> None:
+        # Plain sync function and lambda whose parameters are not named
+        # retry_state; the async path must not pass the state by keyword.
+        def naked(state: RetryCallState) -> float:
+            return 0.01
+
+        # Inline lambda, as in the repro script.
+        state = RetryCallState(None, None, (), {})
+        assert await self._invoke(
+            wait_combine(naked, wait_fixed(0.01)), state
+        ) == 0.02
+        assert await self._invoke(
+            wait_chain(naked, wait_fixed(0.05)), state
+        ) == 0.01
+        assert await self._invoke(
+            wait_combine(lambda rs: 0.01, wait_fixed(0.01)), state
+        ) == 0.02
+        assert await self._invoke(
+            wait_chain(lambda rs: 0.01, wait_fixed(0.05)), state
+        ) == 0.01
+
+    @asynctest
+    async def test_wait_combiners_await_async_members(self) -> None:
+        async def async_naked(state: RetryCallState) -> float:
+            return 0.01
+
+        state = RetryCallState(None, None, (), {})
+        # The same constructor names transparently dispatch to the
+        # async-aware implementation once a member is a coroutine callable.
+        assert isinstance(wait_combine(async_naked), wait_combine)
+        assert isinstance(wait_chain(async_naked), wait_chain)
+        assert await self._invoke(
+            wait_combine(async_naked, wait_fixed(0.01)), state
+        ) == 0.02
+        assert await self._invoke(
+            wait_chain(async_naked, wait_fixed(0.05)), state
+        ) == 0.01
+
+    @asynctest
+    async def test_wait_combiners_run_inside_async_retrying(self) -> None:
+        # End-to-end: one plain function works in every combiner on the
+        # async retry path, both as a first and later attempt member.
+        def naked(state: RetryCallState) -> float:
+            return 0.001
+
+        attempts: list[int] = []
+
+        async def flaky() -> str:
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise ValueError("boom")
+            return "ok"
+
+        for wait in (
+            wait_combine(naked, wait_fixed(0.001)),
+            wait_chain(naked, wait_fixed(0.001)),
+        ):
+            attempts.clear()
+            result = await AsyncRetrying(
+                wait=wait, stop=stop_after_attempt(5)
+            )(flaky)
+            assert result == "ok"
+            assert len(attempts) == 3
+
+    @asynctest
+    async def test_empty_wait_combiners_keep_their_behavior(self) -> None:
+        state = RetryCallState(None, None, (), {})
+        # Empty wait_combine stays usable and yields zero.
+        assert await self._invoke(wait_combine(), state) == 0
+
+        thing = NoIOErrorAfterCount(2)
+        await AsyncRetrying(
+            wait=wait_combine(), stop=stop_after_attempt(5)
+        )(_async_function, thing)
+        assert thing.counter == thing.count
+
+        # Empty wait_chain keeps raising at construction time, same as sync.
+        with pytest.raises(ValueError):
+            wait_chain()
 
     @asynctest
     async def test_wait_falsy_values_mean_no_wait(self) -> None:

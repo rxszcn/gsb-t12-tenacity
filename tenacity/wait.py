@@ -93,7 +93,24 @@ class wait_random(wait_base):
 
 
 class wait_combine(wait_base):
-    """Combine several waiting strategies."""
+    """Combine several waiting strategies.
+
+    Members are always called with the state as the single positional
+    argument, the same convention used by `Retrying._run_wait` and by
+    `wait_chain`. A member may therefore be a wait strategy instance, a
+    plain function or a lambda regardless of its parameter name.
+    """
+
+    def __new__(cls, *strategies: "WaitBaseT") -> "wait_combine":
+        # Transparently use the async-aware variant when a member is a
+        # coroutine callable, so the same constructor call works in both
+        # `Retrying` and `AsyncRetrying`. The subclass is a `wait_combine`,
+        # so isinstance/`+` chaining keep working.
+        if cls is wait_combine and any(
+            _utils.is_coroutine_callable(s) for s in strategies
+        ):
+            return super().__new__(_async_wait_combine)
+        return super().__new__(cls)
 
     def __init__(self, *strategies: "WaitBaseT") -> None:
         self.wait_funcs = strategies
@@ -105,6 +122,17 @@ class wait_combine(wait_base):
         # keyword crashed on any callable whose parameter is not named
         # `retry_state`.
         return float(sum(x(retry_state) for x in self.wait_funcs))
+
+
+class _async_wait_combine(wait_combine):
+    """`wait_combine` whose members may be coroutine callables."""
+
+    @override
+    async def __call__(self, retry_state: "RetryCallState") -> float:  # type: ignore[override]
+        total = 0.0
+        for strategy in self.wait_funcs:
+            total += await _utils.wrap_to_async_func(strategy)(retry_state)
+        return float(total)
 
 
 class wait_chain(wait_base):
@@ -123,16 +151,41 @@ class wait_chain(wait_base):
                   "thereafter.")
     """
 
-    def __init__(self, *strategies: wait_base) -> None:
+    def __new__(cls, *strategies: "WaitBaseT") -> "wait_chain":
+        # See `wait_combine.__new__`: pick the async-aware variant
+        # transparently so the same constructor call serves both
+        # `Retrying` and `AsyncRetrying`.
+        if cls is wait_chain and any(
+            _utils.is_coroutine_callable(s) for s in strategies
+        ):
+            return super().__new__(_async_wait_chain)
+        return super().__new__(cls)
+
+    def __init__(self, *strategies: "WaitBaseT") -> None:
         if not strategies:
             raise ValueError("wait_chain() requires at least one strategy")
         self.strategies = strategies
 
+    def _select(self, retry_state: "RetryCallState") -> "WaitBaseT":
+        wait_func_no = min(max(retry_state.attempt_number, 1), len(self.strategies))
+        return self.strategies[wait_func_no - 1]
+
     @override
     def __call__(self, retry_state: "RetryCallState") -> float:
-        wait_func_no = min(max(retry_state.attempt_number, 1), len(self.strategies))
-        wait_func = self.strategies[wait_func_no - 1]
-        return wait_func(retry_state=retry_state)
+        # Positional: members only promise to take the state positionally,
+        # regardless of whether they are wait strategy instances, plain
+        # functions or lambdas. This matches `wait_combine` and the way
+        # `BaseRetrying._run_wait` invokes the wait strategy itself.
+        return self._select(retry_state)(retry_state)
+
+
+class _async_wait_chain(wait_chain):
+    """`wait_chain` whose members may be coroutine callables."""
+
+    @override
+    async def __call__(self, retry_state: "RetryCallState") -> float:  # type: ignore[override]
+        strategy = self._select(retry_state)
+        return await _utils.wrap_to_async_func(strategy)(retry_state)
 
 
 class wait_exception(wait_base):

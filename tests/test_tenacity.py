@@ -612,6 +612,97 @@ class TestWaitConditions(unittest.TestCase):
         with self.assertRaises(ValueError):
             Retrying(wait=tenacity.wait_chain())
 
+    # -- Convention: how wait combiners call their members -------------------
+    #
+    # Every wait combiner (wait_combine and wait_chain) calls each member
+    # exactly once, with the RetryCallState as the single *positional*
+    # argument -- never as `retry_state=...`. Thus the same member object can
+    # be dropped into any combiner no matter what its parameter is named, and
+    # a member may be a built-in wait strategy, a plain function, or a
+    # lambda. The async counterparts are tested in test_asyncio.py.
+
+    def test_combiners_accept_all_member_kinds(self) -> None:
+        # wait_combine sums every member on each call; wait_chain selects one
+        # member per attempt (attempt 1 -> first member).
+        cases = [
+            (
+                lambda wait_fn: tenacity.wait_combine(
+                    wait_fn, tenacity.wait_fixed(1)
+                ),
+                5.0,
+            ),
+            (
+                lambda wait_fn: tenacity.wait_chain(
+                    wait_fn, tenacity.wait_fixed(1)
+                ),
+                4.0,
+            ),
+        ]
+        for make_combiner, expected in cases:
+            with self.subTest(combiner=make_combiner):
+                # Built-in wait strategy instance
+                self.assertEqual(
+                    make_combiner(tenacity.wait_fixed(4))(
+                        make_retry_state(1, 0)
+                    ),
+                    expected,
+                )
+
+                # Plain function whose parameter is *not* named retry_state
+                def naked(state: RetryCallState) -> float:
+                    return 4.0
+
+                self.assertEqual(
+                    make_combiner(naked)(make_retry_state(1, 0)), expected
+                )
+
+                # Lambda -- the repro's regression shape
+                self.assertEqual(
+                    make_combiner(lambda rs: 4.0)(make_retry_state(1, 0)),
+                    expected,
+                )
+
+    def test_combiners_pass_state_positionally(self) -> None:
+        # Members receive exactly one positional argument and no keyword
+        # arguments; the parameter name is the member's own business.
+        calls: list[tuple[tuple[typing.Any, ...], dict[str, typing.Any]]] = []
+
+        def recorder(
+            *args: typing.Any, **kwargs: typing.Any
+        ) -> float:
+            calls.append((args, kwargs))
+            return 2.5
+
+        state = make_retry_state(1, 0)
+        combined = tenacity.wait_combine(recorder, tenacity.wait_fixed(1))
+        self.assertEqual(combined(state), 3.5)
+        chained = tenacity.wait_chain(recorder, tenacity.wait_fixed(9))
+        self.assertEqual(chained(state), 2.5)
+        self.assertEqual(
+            calls, [((state,), {}), ((state,), {})]
+        )
+
+    def test_same_function_works_in_every_combiner(self) -> None:
+        # One signature must fit every combiner -- no per-combiner adapters.
+        def naked(state: RetryCallState) -> float:
+            return 7.0
+
+        state = make_retry_state(1, 0)
+        self.assertEqual(tenacity.wait_combine(naked)(state), 7.0)
+        self.assertEqual(tenacity.wait_chain(naked)(state), 7.0)
+
+    def test_empty_combiners_keep_their_behavior(self) -> None:
+        # wait_combine() stays constructible and evaluates to 0 (the identity
+        # for addition), so `sum([])` and empty argument lists keep working.
+        empty_combine = tenacity.wait_combine()
+        self.assertEqual(empty_combine(make_retry_state(1, 0)), 0)
+        r = Retrying(wait=empty_combine)
+        self.assertEqual(r.wait(make_retry_state(1, 5)), 0)
+
+        # wait_chain() keeps rejecting the empty case at construction time.
+        with self.assertRaises(ValueError):
+            tenacity.wait_chain()
+
     def test_wait_random_exponential(self) -> None:
         fn = tenacity.wait_random_exponential(0.5, 60.0)
 
